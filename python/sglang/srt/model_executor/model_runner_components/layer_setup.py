@@ -196,6 +196,12 @@ def _assert_pp_mtp_compat(
     num_effective_layers: int,
     model_num_layers: int,
 ) -> None:
+    from sglang.srt.runtime_context import get_disagg
+
+    # A PD prefill never runs verify across stages: EagleWorkerV2 hosts the
+    # draft on the last stage only and pools size from this stage's layer range.
+    if get_disagg().disaggregation_mode == "prefill":
+        return
     assert (
         (not model_has_mtp_layers)
         or (spec_algorithm.is_none())

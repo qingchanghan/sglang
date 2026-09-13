@@ -49,9 +49,11 @@ def check_server_args(server_args: Any):
     )
 
     if cfg.pp_size > 1:
+        # EAGLE under PP hosts the draft on the last stage only (EagleWorkerV2),
+        # which is what lets a PD prefill ship its draft KV; overlap stays out.
         assert (
-            cfg.disable_overlap_schedule and cfg.speculative_algorithm is None
-        ), "Pipeline parallelism is not compatible with overlap schedule, speculative decoding"
+            cfg.disable_overlap_schedule
+        ), "Pipeline parallelism is not compatible with overlap schedule"
         assert cfg.min_free_slots_delay is None, (
             "--min-free-slots-delay is not supported with pipeline "
             "parallelism: allocatable slots per microbatch are bounded by "

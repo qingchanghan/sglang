@@ -283,8 +283,15 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
     def init_lm_head(self):
         from sglang.srt.lora.layers import unwrap_lora_layer
+        from sglang.srt.speculative.draft_embed_tokens import (
+            resolve_draft_embed_and_head,
+        )
 
-        embed, head = self.target_worker.model_runner.model.get_embed_and_head()
+        embed, head = resolve_draft_embed_and_head(
+            target_model=self.target_worker.model_runner.model,
+            draft_model=self.draft_runner.model,
+            model_path=self.target_worker.model_runner.model_config.model_path,
+        )
         target_lm_head = unwrap_lora_layer(
             getattr(self.target_worker.model_runner.model, "lm_head", None)
         )

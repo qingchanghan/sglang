@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Any, Optional
 import msgspec
 
 from sglang.srt.configs.model_config import ModelImpl
-from sglang.srt.distributed import get_world_group
+from sglang.srt.distributed import get_tp_group, get_world_group
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     prealloc_symmetric_memory_pool,
 )
@@ -61,23 +61,23 @@ logger = logging.getLogger(__name__)
 def _align_pipeline_layers(layers: list, layer_model) -> list:
     has_start_layer = hasattr(layer_model, "start_layer")
     has_end_layer = hasattr(layer_model, "end_layer")
-    assert (
-        has_start_layer == has_end_layer
-    ), "pipeline layer ranges must define start_layer and end_layer together"
+    assert has_start_layer == has_end_layer, (
+        "pipeline layer ranges must define start_layer and end_layer together"
+    )
     start_layer = layer_model.start_layer if has_start_layer else 0
     end_layer = layer_model.end_layer if has_end_layer else len(layer_model.layers)
-    assert isinstance(start_layer, int) and isinstance(
-        end_layer, int
-    ), "pipeline layer ranges must define integer start_layer and end_layer"
+    assert isinstance(start_layer, int) and isinstance(end_layer, int), (
+        "pipeline layer ranges must define integer start_layer and end_layer"
+    )
     assert 0 <= start_layer <= end_layer <= len(layer_model.layers), (
         f"invalid pipeline layer range [{start_layer}, {end_layer}) for "
         f"{len(layer_model.layers)} layers"
     )
     if len(layers) == len(layer_model.layers):
         return layers
-    assert (
-        len(layers) <= end_layer - start_layer
-    ), f"found {len(layers)} layers in PP range [{start_layer}, {end_layer})"
+    assert len(layers) <= end_layer - start_layer, (
+        f"found {len(layers)} layers in PP range [{start_layer}, {end_layer})"
+    )
     return (
         [None] * start_layer + layers + [None] * (len(layer_model.layers) - end_layer)
     )
@@ -157,6 +157,15 @@ class CudaGraphsCapture(msgspec.Struct, frozen=True, kw_only=True):
         )
 
 
+def graph_budget_group(*, is_draft_worker: bool):
+    # A spec draft may be hosted on one PP stage only (EagleWorkerV2 builds it
+    # on the last stage), so its memory-budget collective must span exactly
+    # the ranks running it: its TP group. The target runs on every rank.
+    if is_draft_worker:
+        return get_tp_group()
+    return get_world_group()
+
+
 def capture_cuda_graphs(
     *, model_runner: ModelRunner, capture_decode_cuda_graph: bool = True
 ) -> CudaGraphsCapture:
@@ -214,12 +223,12 @@ def capture_cuda_graphs(
             set_masked_standard_layout_memory_budget,
         )
 
-        world_group = get_world_group()
+        budget_group = graph_budget_group(is_draft_worker=model_runner.is_draft_worker)
         available_memory_gb = get_available_gpu_memory(
             model_runner.device,
             model_runner.gpu_id,
-            distributed=world_group.world_size > 1,
-            cpu_group=world_group.cpu_group,
+            distributed=budget_group.world_size > 1,
+            cpu_group=budget_group.cpu_group,
         )
         budget_bytes = set_masked_standard_layout_memory_budget(
             int(available_memory_gb * (1 << 30))
