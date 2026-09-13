@@ -45,12 +45,18 @@ from sglang.srt.sampling.sampling_observer_pp import (
 )
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.utils import DynamicGradMode, broadcast_pyobj, point_to_point_pyobj
-from sglang.srt.utils.common import get_device_module, is_xpu
+from sglang.srt.utils.common import get_device_module
 
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
+
+
+def pp_output_exchange_send_first(*, pp_rank: int) -> bool:
+    # Even ranks send then recv, odd ranks recv then send; with one send and
+    # one recv per rank per round this leaves no all-senders cycle in the ring.
+    return pp_rank % 2 == 0
 
 
 def _pp_can_skip_output_comm(batch: ScheduleBatch) -> bool:
@@ -1290,18 +1296,15 @@ class SchedulerPPMixin:
         batch_result = None
         send_output_work = []
 
-        # On CUDA, isend is async: it enqueues to the stream and returns,
-        # so every rank can send first safely. On some backends isend is
-        # effectively blocking and does not return until the peer posts a
-        # matching recv; if every PP rank sends first, all ranks block
-        # waiting for a receiver and the ring deadlocks. Order send/recv
-        # by pp_rank parity (even: send->recv, odd: recv->send) so each
-        # adjacent pair has one sender and one receiver posted at the
-        # same time.
-
-        # CUDA: send first
-        # XPU: even ranks send first, odd ranks recv first.
-        send_first = (not is_xpu()) or ((self.ps.pp_rank % 2) == 0)
+        # A NCCL send kernel completes only once the peer posts the matching
+        # recv, and the peer's recv sits behind its own sends on the same
+        # stream. When both ends of a PP pair exchange an output dict in one
+        # round (a chunked prefill hand-off: rank 0 relays chunk i's outputs
+        # while the last rank sends chunk i+1's), every rank sending first
+        # deadlocks the ring; NCCL's eager path only hides it for one-tensor
+        # dicts. Order by pp_rank parity (even: send->recv, odd: recv->send)
+        # so each adjacent pair always has one receiver posted.
+        send_first = pp_output_exchange_send_first(pp_rank=self.ps.pp_rank)
 
         def _do_send():
             return self._pp_send_output_to_next_stage(
