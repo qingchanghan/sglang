@@ -53,6 +53,7 @@ from sglang.srt.layers.attention.dsa.dsa_topk_backend import (
     DSATopKBackend,
     TopkTransformMethod,
 )
+from sglang.srt.layers.attention.dsa.ragged_offsets import pad_ragged_offsets
 from sglang.srt.layers.attention.dsa.utils import (
     can_dsa_prefill_cp_round_robin_split,
     compute_dsa_seqlens,
@@ -1980,6 +1981,9 @@ class DeepseekSparseAttnBackend(
                     topk_indices = self._pad_topk_indices(topk_indices, q_nope.shape[0])
                 topk_indices_offset = metadata.topk_indices_offset
                 assert topk_indices_offset is not None
+                topk_indices_offset = pad_ragged_offsets(
+                    topk_indices_offset, q_nope.shape[0]
+                )
                 mask = topk_indices != -1
                 topk_indices_offset = (
                     topk_indices_offset.unsqueeze(1)
