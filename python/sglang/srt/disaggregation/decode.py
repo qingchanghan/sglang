@@ -37,6 +37,10 @@ from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.disaggregation.common.conn import CommonKVManager, CommonKVReceiver
+from sglang.srt.disaggregation.draft_pool_probe import (
+    maybe_probe_draft_pool,
+    maybe_probe_draft_pool_batch,
+)
 from sglang.srt.disaggregation.decode_hicache_mixin import (
     DecodeHiCachePreallocMixin,
     DecodeHiCacheTransferMixin,
@@ -1873,6 +1877,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             ),
             kv_loc,
         )
+        maybe_probe_draft_pool(scheduler=self.scheduler, req=req, stage="prealloc")
 
         # Truncate fill_len to kv_committed_len so cache_unfinished_req only
         # inserts committed KV into the radix tree. The last output token
@@ -2329,6 +2334,9 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 ):
                     continue
                 self._commit_transfer_to_req(decode_req)
+                maybe_probe_draft_pool(
+                    scheduler=self.scheduler, req=decode_req.req, stage="transferred"
+                )
                 indices_to_remove.add(i)
                 # Check if request was aborted due to corruption
                 if isinstance(decode_req.req.finished_reason, FINISH_ABORT):
@@ -2477,6 +2485,9 @@ class SchedulerDisaggregationDecodeMixin:
             if batch:
                 result = self.run_batch(batch)
                 self.process_batch_result(batch, result)
+                maybe_probe_draft_pool_batch(
+                    scheduler=self, reqs=batch.reqs, stage="after_gen"
+                )
             else:
                 # When the server is idle, do self-check and re-init some states
                 self.on_idle()
@@ -2492,6 +2503,9 @@ class SchedulerDisaggregationDecodeMixin:
         def pop_and_process():
             tmp_batch, tmp_result = self.result_queue.popleft()
             self.process_batch_result(tmp_batch, tmp_result)
+            maybe_probe_draft_pool_batch(
+                scheduler=self, reqs=tmp_batch.reqs, stage="after_gen"
+            )
 
         while True:
             # Pending rooms from the prior cycle can overlap request intake and
@@ -2661,6 +2675,9 @@ class SchedulerDisaggregationDecodeMixin:
             # Drain it before a prebuilt request seeds a potentially reused row.
             self.schedule_stream.wait_stream(self.forward_stream)
         new_batch.process_prebuilt(self.future_map)
+        maybe_probe_draft_pool_batch(
+            scheduler=self, reqs=new_batch.reqs, stage="first_batch"
+        )
 
         return new_batch
 

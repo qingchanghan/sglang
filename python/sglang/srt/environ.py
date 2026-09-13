@@ -472,6 +472,10 @@ class Envs:
     SGLANG_GDN_DECODE_FUSION_VERIFY_REAL_TENSORS = EnvBool(False)
     # NaN-fill the unified memory pool at boot (debug repro switch).
     SGLANG_DEBUG_POISON_POOL = EnvBool(False)
+    # PD decode read-only pool probe: rid substring to probe, and an optional
+    # JSONL path (a .rank<tp_rank> suffix is appended); see draft_pool_probe.py.
+    SGLANG_DRAFT_POOL_PROBE_RID = EnvStr(None)
+    SGLANG_DRAFT_POOL_PROBE_PATH = EnvStr(None)
     SGLANG_DEBUG_REVERT_PR = EnvInt(0)
     SGLANG_PHASE_CHECKER_DEBUG = EnvBool(False)
     SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK = EnvBool(True)
