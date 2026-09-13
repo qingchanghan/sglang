@@ -76,12 +76,28 @@ def validate_hisparse_kv_cache_dtype(server_args: ServerArgs) -> None:
     )
 
 
+def validate_hisparse_speculative(server_args: ServerArgs) -> None:
+    cfg = resolving_view(server_args)
+    if cfg.speculative_algorithm is None:
+        return
+    # Spec decode prep skips the coordinator's per-token device-buffer mapping
+    # and host backup, and the swap-in kernel takes one top-k row per request.
+    raise ValueError(
+        "--enable-hisparse does not support speculative decoding "
+        f"(--speculative-algorithm={cfg.speculative_algorithm}): speculative "
+        "KV bookkeeping and multi-query swap-in are not implemented. "
+        "Drop one of the two options."
+    )
+
+
 def validate_hisparse(server_args: ServerArgs) -> None:
     """Validate --enable-hisparse constraints (model class, radix cache, DSA backend)."""
 
     cfg = resolving_view(server_args)
     if not cfg.enable_hisparse:
         return
+
+    validate_hisparse_speculative(server_args)
 
     from sglang.srt.configs.model_config import (
         is_deepseek_dsa,
