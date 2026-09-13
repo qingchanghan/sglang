@@ -1100,10 +1100,17 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
             else:
                 bootstrap_fields = f"bootstrap_queue_duration={self.format_duration(bootstrap_queue_duration)}, "
 
+            # Last prefill completion -> P finalizing successful KV transfer.
+            # Includes host-side handling and polling, not just network time.
+            transfer_wait = self.duration_between(
+                self.prefill_finished_time, self.prefill_kv_transfer_finish_time
+            )
+
             return (
                 f"{bootstrap_fields}"
                 f"queue_duration={self.format_duration(queue_duration)}, "
                 f"forward_duration={self.format_duration(forward_duration)}, "
+                f"transfer_wait={self.format_duration(transfer_wait)}, "
                 f"entry_time={self.format_wallclock(self.prefill_bootstrap_queue_entry_time)}, "
                 f"transfer_speed={self.transfer_speed_gb_s:.2f} GB/s, "
                 f"transfer_total={self.transfer_total_mb:.2f} MB"
