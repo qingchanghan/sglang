@@ -240,6 +240,20 @@ class EagerRunner(BaseRunner):
             )
         return model_runner.attn_backend, contextlib.nullcontext()
 
+    def _decode_plan_backend(self, *, forward_batch: ForwardBatch, attn_backend):
+        # A multi-step EAGLE draft decode runs under a per-step forward context
+        # while model_runner.attn_backend is the draft-extend backend; plan its
+        # steps through the published multi-step wrapper, on the padded batch.
+        draft_attn_backend = self.model_runner.draft_attn_backend
+        spec_info = forward_batch.spec_info
+        if (
+            draft_attn_backend is not None
+            and spec_info is not None
+            and spec_info.is_draft_input()
+        ):
+            return draft_attn_backend
+        return attn_backend
+
     def _execute_decode(
         self,
         forward_batch: ForwardBatch,
@@ -255,7 +269,9 @@ class EagerRunner(BaseRunner):
                 # Prepare model-specific attention metadata before planning,
                 # e.g. Moss-VL's prefill cross-attention custom mask.
                 model_runner.model.prepare_forward_batch(forward_batch)
-            attn_backend.init_forward_metadata(forward_batch)
+            self._decode_plan_backend(
+                forward_batch=forward_batch, attn_backend=attn_backend
+            ).init_forward_metadata(forward_batch)
         # FIXME: add pp_proxy_tensors arg to all models
         kwargs = model_runner._pp_kwargs(pp_proxy_tensors)
 

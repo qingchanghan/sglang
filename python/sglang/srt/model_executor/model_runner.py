@@ -450,6 +450,10 @@ class ModelRunner:
         # For hisparse (must be set before initialize() so CUDA graph capture can see it)
         self.hisparse_coordinator = None
 
+        # Multi-step draft backend published by EagleDraftWorker on its draft
+        # runner; EagerRunner plans draft decodes through it. None on targets.
+        self.draft_attn_backend = None
+
         # The native overlap path replaces this during load_model(). Keep the
         # no-pending-work invariant for lightweight backends that override the
         # base initialization and weight-loading flow.

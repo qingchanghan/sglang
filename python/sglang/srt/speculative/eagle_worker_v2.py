@@ -546,6 +546,10 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 if (
                     not forward_batch.forward_mode.is_idle()
                     and self.speculative_num_steps > 1
+                    # DP attention pads the batch inside each per-step forward;
+                    # planning the unpadded rows here desyncs the per-row
+                    # metadata, so EagerRunner plans after padding instead.
+                    and forward_batch.global_num_tokens_cpu is None
                 ):
                     # Skip attention backend init for 1-step draft,
                     # `draft_forward` only does sample in this case.
