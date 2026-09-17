@@ -2391,12 +2391,23 @@ class Scheduler(
         # into the waiting queue but can never be scheduled, blocking the queue
         # and eventually making health checks fail.
         paged_input_len = -(-input_len // self.page_size) * self.page_size
+        # HiSparse parks the latent KV on the host, so a request's token budget
+        # is bounded by the host-backed logical pool rather than the device
+        # pool. PrefillAdder keeps gating on device slots, and on this path the
+        # two budgets legitimately differ: clamping to the device pool here
+        # would silently drive max_new_tokens to zero for long prompts, which
+        # returns an empty completion instead of rejecting the request.
+        token_capacity = (
+            self.tp_worker.model_runner.max_token_pool_size
+            if self.enable_hisparse
+            else self.max_total_num_tokens
+        )
         req.sampling_params.max_new_tokens = max(
             0,
             min(
                 max_new_tokens,
                 self.max_req_len - input_len - 1,
-                self.max_total_num_tokens * get_parallel().attn_dcp_size
+                token_capacity * get_parallel().attn_dcp_size
                 - paged_input_len
                 - self.page_size
                 - 1,

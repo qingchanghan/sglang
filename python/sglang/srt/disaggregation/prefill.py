@@ -165,8 +165,10 @@ class PrefillBootstrapQueue:
         self.queue: List[Req] = []
         self.gloo_group = gloo_group
         self.scheduler = scheduler
+        # Mirror decode.py: HiSparse admits up to the host-backed logical
+        # capacity, which falls back to the device pool when it is disabled.
         self.max_total_num_tokens = (
-            self.scheduler.tp_worker.model_runner.effective_max_total_num_tokens
+            self.scheduler.tp_worker.model_runner.max_token_pool_size
         )
         self.transfer_backend = transfer_backend
         if envs.SGLANG_DISAGG_STAGING_BUFFER.get():
