@@ -3311,6 +3311,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.mamba_track_mask_next_cpu = None
             self.mamba_decode_batch_idx_cpu = None
             spec_prepare_for_decode(self)
+            if self.hisparse_coordinator is not None:
+                self.hisparse_coordinator.prepare_speculative_decode(
+                    reqs=self.reqs,
+                    req_pool_indices=self.req_pool_indices,
+                    reserve=get_alloc_reserve_per_decode(),
+                )
             return
 
         # Beam member rows ride this decode batch: append them to the row

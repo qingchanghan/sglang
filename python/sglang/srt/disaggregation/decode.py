@@ -544,15 +544,23 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             kv_data_mem_kinds += ["VRAM"] * len(device_kv_data_ptrs[c4_layer_num:])
         num_draft_entries = 0
         if self.draft_token_to_kv_pool is not None:
-            # We should also transfer draft model kv cache. The indices are
-            # always shared with a target model.
+            draft_transfer_pool = self.draft_token_to_kv_pool
+            draft_memory_kind = "VRAM"
+            if self.scheduler.enable_hisparse:
+                # The PD message carries host indices for both target and draft KV.
+                draft_transfer_pool = (
+                    self.scheduler.hisparse_coordinator.bind_resident_draft_pool(
+                        self.draft_token_to_kv_pool
+                    )
+                )
+                draft_memory_kind = "DRAM"
             draft_kv_data_ptrs, draft_kv_data_lens, draft_kv_item_lens = (
-                self.draft_token_to_kv_pool.get_contiguous_buf_infos()
+                draft_transfer_pool.get_contiguous_buf_infos()
             )
             kv_data_ptrs += draft_kv_data_ptrs
             kv_data_lens += draft_kv_data_lens
             kv_item_lens += draft_kv_item_lens
-            kv_data_mem_kinds += ["VRAM"] * len(draft_kv_data_ptrs)
+            kv_data_mem_kinds += [draft_memory_kind] * len(draft_kv_data_ptrs)
             num_draft_entries = len(draft_kv_data_ptrs)
 
         kv_args.kv_data_ptrs = kv_data_ptrs

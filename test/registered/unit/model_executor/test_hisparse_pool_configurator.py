@@ -1,6 +1,6 @@
 import unittest
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import torch
 
@@ -13,6 +13,60 @@ register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
 class TestHiSparsePoolConfigurator(CustomTestCase):
+    def test_native_draft_kv_and_indexer_cover_the_full_logical_pool(self):
+        hf_config = SimpleNamespace(
+            architectures=["GlmMoeDsaForCausalLM"],
+            index_topk=2048,
+            index_head_dim=128,
+        )
+        hf_config.get_text_config = lambda: hf_config
+        for ratio, expected in [(2, 3416), (6, 7624)]:
+            with self.subTest(ratio=ratio):
+                override = get_context().override_server_args(
+                    enable_hisparse=True,
+                    hisparse_config=f'{{"host_to_device_ratio": {ratio}}}',
+                    enable_hierarchical_cache=False,
+                    disaggregation_mode="decode",
+                    dsa_prefill_backend="flashmla_kv",
+                    dsa_decode_backend="flashmla_kv",
+                )
+                server_args = override.install()
+                try:
+                    kvc = MagicMock(
+                        use_mla_backend=True,
+                        kv_cache_dtype=torch.float8_e4m3fn,
+                        kv_cache_dtype_str="fp8_e4m3",
+                        is_draft_worker=False,
+                        model_config=SimpleNamespace(
+                            kv_lora_rank=512,
+                            qk_rope_head_dim=64,
+                            context_len=131072,
+                            hf_config=hf_config,
+                        ),
+                        layer_info=SimpleNamespace(
+                            start_layer=0, end_layer=2, num_effective_layers=2
+                        ),
+                        spec_aux_config=SimpleNamespace(eagle_draft_num_layers=1),
+                        spec_algorithm=SimpleNamespace(
+                            is_eagle=lambda: True,
+                            is_standalone=lambda: False,
+                            is_dflash_family=lambda: False,
+                        ),
+                        server_args=server_args,
+                    )
+                    with (
+                        get_parallel().override(attn_tp_size=1),
+                        patch(
+                            "sglang.srt.model_executor.pool_configurator.mambaish_config",
+                            return_value=None,
+                        ),
+                    ):
+                        self.assertEqual(
+                            DefaultPoolConfigurator(kvc)._cell_size, expected
+                        )
+                finally:
+                    override.restore()
+
     def _compute_cell_size(
         self,
         kv_cache_dtype: torch.dtype,

@@ -176,45 +176,58 @@ def _assert_output_matches_tokens(
 class TestHiSparseSpec(CustomTestCase):
     def test_small_scratch_preserves_a_full_hot_sized_union(self) -> None:
         """Every selected KV row survives scratch overflow and cache rotation."""
-        hot_size, page_size, num_steps, top_k = 8192, 64, 4, 2048
-        total_occurrences = num_steps * top_k
-        for scratch_size in (1, 64, 256, 8192):
-            for num_hits in (0, 4096):
-                with self.subTest(scratch_size=scratch_size, num_hits=num_hits):
-                    state = _make_state(
-                        num_reqs=1,
-                        hot_buffer_size=hot_size,
-                        page_size=page_size,
+        hot_size, page_size, top_k = 8192, 64, 2048
+        for num_steps in (2, 3, 4):
+            total_occurrences = num_steps * top_k
+            for scratch_size in (1, 64, 256, 8192):
+                for num_hits in (0, total_occurrences // 2):
+                    with self.subTest(
+                        num_steps=num_steps,
                         scratch_size=scratch_size,
-                        seq_len=65536,
-                        item_words=82,
-                        metadata_occurrences=total_occurrences,
-                    )
-                    seq_lens = torch.full(
-                        (num_steps,), 65536, dtype=torch.int32, device=DEVICE
-                    )
-                    for iteration in range(3):
-                        num_misses = total_occurrences - num_hits
-                        hits = torch.arange(num_hits, dtype=torch.int32, device=DEVICE)
-                        misses = (
-                            hot_size
-                            + iteration * total_occurrences
-                            + torch.arange(num_misses, dtype=torch.int32, device=DEVICE)
+                        num_hits=num_hits,
+                    ):
+                        state = _make_state(
+                            num_reqs=1,
+                            hot_buffer_size=hot_size,
+                            page_size=page_size,
+                            scratch_size=scratch_size,
+                            seq_len=65536,
+                            item_words=82,
+                            metadata_occurrences=total_occurrences,
                         )
-                        tokens = torch.cat((hits, misses)).view(1, num_steps, top_k)
-                        out = _run_swap(
-                            top_k_tokens=tokens, seq_lens=seq_lens, state=state
+                        seq_lens = torch.full(
+                            (num_steps,), 65536, dtype=torch.int32, device=DEVICE
                         )
-                        torch.cuda.synchronize()
-                        self.assertTrue(out.ge(0).all().item())
-                        self.assertEqual(torch.unique(out).numel(), total_occurrences)
-                        _assert_output_matches_tokens(state, out, tokens)
-                        out = _run_swap(
-                            top_k_tokens=tokens, seq_lens=seq_lens, state=state
-                        )
-                        torch.cuda.synchronize()
-                        _assert_output_matches_tokens(state, out, tokens)
-                        self.assertEqual(state.swap_state.scratch_state[0, 0].item(), 0)
+                        for iteration in range(3):
+                            num_misses = total_occurrences - num_hits
+                            hits = torch.arange(
+                                num_hits, dtype=torch.int32, device=DEVICE
+                            )
+                            misses = (
+                                hot_size
+                                + iteration * total_occurrences
+                                + torch.arange(
+                                    num_misses, dtype=torch.int32, device=DEVICE
+                                )
+                            )
+                            tokens = torch.cat((hits, misses)).view(1, num_steps, top_k)
+                            out = _run_swap(
+                                top_k_tokens=tokens, seq_lens=seq_lens, state=state
+                            )
+                            torch.cuda.synchronize()
+                            self.assertTrue(out.ge(0).all().item())
+                            self.assertEqual(
+                                torch.unique(out).numel(), total_occurrences
+                            )
+                            _assert_output_matches_tokens(state, out, tokens)
+                            out = _run_swap(
+                                top_k_tokens=tokens, seq_lens=seq_lens, state=state
+                            )
+                            torch.cuda.synchronize()
+                            _assert_output_matches_tokens(state, out, tokens)
+                            self.assertEqual(
+                                state.swap_state.scratch_state[0, 0].item(), 0
+                            )
 
     def test_small_scratch_records_replayable_full_union_plan(self) -> None:
         """Copy-only shared layers resolve the same rows after direct overflow."""
@@ -285,7 +298,7 @@ class TestHiSparseSpec(CustomTestCase):
         tokens = tokens.view(1, num_steps, top_k).repeat(2, 1, 1).contiguous()
         out = torch.empty_like(tokens)
         req_indices = torch.tensor([1, 0], dtype=torch.int64, device=DEVICE)
-        real_count = torch.ones(1, dtype=torch.int32, device=DEVICE)
+        real_count = torch.zeros(1, dtype=torch.int32, device=DEVICE)
         seq_lens = torch.full((2 * num_steps,), 65536, dtype=torch.int32, device=DEVICE)
 
         def run():
@@ -298,12 +311,19 @@ class TestHiSparseSpec(CustomTestCase):
                 num_real_reqs=real_count,
             )
 
+        # Startup capture has no allocated request buffers; even invalid locs
+        # must be ignored until replay supplies a nonzero real request count.
+        scratch_locs = state.swap_state.scratch_locs.clone()
+        state.swap_state.scratch_locs.fill_(-1)
         run()
         torch.cuda.synchronize()
+        self.assertTrue(out.eq(0).all().item())
         untouched = state.swap_state.cache_index[0].clone()
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             run()
+        state.swap_state.scratch_locs.copy_(scratch_locs)
+        real_count.fill_(1)
         for iteration in range(3):
             tokens[0].copy_(
                 (

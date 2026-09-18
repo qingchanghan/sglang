@@ -511,6 +511,11 @@ class KVCacheConfigurator:
                 sizes = msgspec.structs.replace(
                     sizes, max_total_num_tokens=draft_virtual_id_space
                 )
+            if isinstance(token_to_kv_pool_allocator, HiSparseTokenToKVPoolAllocator):
+                draft_virtual_id_space = token_to_kv_pool_allocator.size_full
+                sizes = msgspec.structs.replace(
+                    sizes, max_total_num_tokens=draft_virtual_id_space
+                )
 
         # Initialize req_to_token_pool
         if req_to_token_pool is None:
@@ -1494,7 +1499,7 @@ class KVCacheConfigurator:
             dsa_cp_layer_shard_size,
         ) = get_glm_dsa_cp_layer_shard_info(self)
         pool_kwargs = {}
-        if get_memory().enable_hisparse:
+        if get_memory().enable_hisparse and not self.is_draft_worker:
             PoolCls = HiSparseDSATokenToKVPool
             from sglang.srt.mem_cache.sparsity import parse_hisparse_config
 
@@ -1924,6 +1929,7 @@ class KVCacheConfigurator:
                             kvcache=token_to_kv_pool,
                             need_sort=need_sort,
                             host_to_device_ratio=hisparse_cfg.host_to_device_ratio,
+                            speculative_decode=self.spec_algorithm.is_speculative(),
                         )
                     elif (
                         get_schedule().page_size == 1 and not get_parallel().dcp_enabled

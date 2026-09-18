@@ -67,7 +67,10 @@ def _parse_sparse_config() -> SparseConfig:
     Optional fields (default None): algorithm, backend, min_sparse_prompt_len,
     page_size. All remaining fields go to sparse_extra_config.
     """
-    extra_config_str = get_memory().hisparse_config
+    return parse_hisparse_config_json(get_memory().hisparse_config)
+
+
+def parse_hisparse_config_json(extra_config_str: Optional[str]) -> SparseConfig:
     if extra_config_str is not None:
         try:
             extra_config = json.loads(extra_config_str)

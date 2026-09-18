@@ -9,9 +9,14 @@ from sglang.kernels.ops.kvcache.hisparse import (
     copy_cache_planned_mla,
     load_cache_to_device_buffer_dsv4_mla,
     load_cache_to_device_buffer_mla,
+    load_cache_to_device_buffer_spec_mla,
 )
 from sglang.srt.configs.model_config import dsa_layer_skips_topk, is_deepseek_dsa
 from sglang.srt.environ import envs
+from sglang.srt.managers.hisparse_spec_state import (
+    HiSparseSpecCache,
+    make_hisparse_spec_layout,
+)
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.allocator.hisparse import (
     DeepSeekV4HiSparseTokenToKVPoolAllocator,
@@ -20,7 +25,7 @@ from sglang.srt.mem_cache.allocator.hisparse import (
 from sglang.srt.mem_cache.hisparse_memory_pool import (
     HiSparseDSATokenToKVPool,
 )
-from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool, ReqToTokenPool
 from sglang.srt.mem_cache.memory_pool_host import DeepSeekV4PagedHostPool
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.srt.utils import get_device_module, is_hip
@@ -55,7 +60,7 @@ def resolve_shared_index_layers(
 
     Mirrors DeepseekV2AttentionMLA's skip_topk derivation (index_topk_pattern /
     index_topk_freq / cli_factor); None when the model has no sharing or the
-    prefetch cannot run (PP, speculative decoding, kill-switch).
+    prefetch cannot run (PP or kill-switch).
     """
     if not is_deepseek_dsa(hf_text_config):
         return None
@@ -67,10 +72,10 @@ def resolve_shared_index_layers(
         pattern = [dsa_layer_skips_topk(hf_text_config, i) for i in range(num_layers)]
     if not any(pattern):
         return None
-    if pp_size != 1 or is_speculative:
+    if pp_size != 1:
         logger.warning(
             "HiSparse shared-index prefetch is unsupported under pipeline "
-            "parallelism / speculative decoding; falling back to synchronous "
+            "parallelism; falling back to synchronous "
             "swap-in."
         )
         return None
@@ -123,6 +128,8 @@ class HiSparseCoordinator:
         host_to_device_ratio: int = 2,
         swap_in_block_size: int = 960,
         shared_index_layers: Optional[List[bool]] = None,
+        speculative_num_draft_tokens: Optional[int] = None,
+        speculative_scratch_size: Optional[int] = None,
     ):
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
@@ -175,6 +182,8 @@ class HiSparseCoordinator:
             )
             self.item_size_bytes = self.mem_pool_host.token_stride_size
         self.page_size = self.mem_pool_device.page_size
+        self.draft_pool: Optional[DSATokenToKVPool] = None
+        self.draft_host_pool: Optional[MLATokenToKVPoolHost] = None
 
         max_num_req_slots = req_to_token_pool.req_to_token.shape[0]
         max_context_len = req_to_token_pool.max_context_len
@@ -186,6 +195,32 @@ class HiSparseCoordinator:
         self.padded_buffer_size = (
             self.device_buffer_size + self.mem_pool_device.page_size
         )
+        self.attention_buffer_size = self.padded_buffer_size
+        self.spec_cache = None
+        self.spec_num_draft_tokens = speculative_num_draft_tokens or 1
+        if speculative_num_draft_tokens is not None:
+            if self.is_dsv4_hisparse:
+                raise ValueError(
+                    "HiSparse speculative MLA does not support DeepSeek V4."
+                )
+            spec_shared_layers = shared_index_layers
+            if (
+                spec_shared_layers is None
+                or len(spec_shared_layers) != self.mem_pool_device.layer_num
+            ):
+                spec_shared_layers = [False] * self.mem_pool_device.layer_num
+            layout = make_hisparse_spec_layout(
+                num_draft_tokens=speculative_num_draft_tokens,
+                top_k=top_k,
+                hot_size=device_buffer_size,
+                page_size=self.page_size,
+                req_slots=max_num_req_slots,
+                shared_layers=spec_shared_layers,
+                scratch_size=speculative_scratch_size,
+            )
+            self.spec_cache = HiSparseSpecCache(layout=layout, device=device)
+            self.padded_buffer_size = layout.buffer_size
+        self._host_committed_lens = [0] * max_num_req_slots
 
         self.req_to_device_buffer = torch.zeros(
             (max_num_req_slots, self.padded_buffer_size),
@@ -232,18 +267,23 @@ class HiSparseCoordinator:
         self._lru_init = torch.arange(
             self.device_buffer_size, dtype=torch.int16, device=device
         )
-        self.lru_slots = (
-            self._lru_init.view(1, 1, -1)
-            .repeat(layer_num, max_num_req_slots, 1)
-            .contiguous()
-        )
+        self.lru_slots = None
+        if self.spec_cache is None:
+            self.lru_slots = (
+                self._lru_init.view(1, 1, -1)
+                .repeat(layer_num, max_num_req_slots, 1)
+                .contiguous()
+            )
         self._device_buffer_arange_i32 = torch.arange(
             self.device_buffer_size, dtype=torch.int32, device=device
         )
 
         # Pre-allocated output buffer for swap_in_selected_pages (CUDA-graph safe)
         self.top_k_device_locs_buffer = torch.full(
-            (max_num_req_slots, self.top_k), -1, dtype=torch.int32, device=device
+            (max_num_req_slots, self.top_k * self.spec_num_draft_tokens),
+            -1,
+            dtype=torch.int32,
+            device=device,
         )
         self.raw_indices_buffer = torch.full(
             (max_num_req_slots, self.top_k), -1, dtype=torch.int32, device=device
@@ -299,10 +339,14 @@ class HiSparseCoordinator:
         # buffer set suffices: the last skip layer's event wait orders the next
         # anchor's writes after this group's copies.
         self._miss_src = torch.zeros(
-            (max_num_req_slots, self.top_k), dtype=torch.int64, device=self.device
+            (max_num_req_slots, self.top_k * self.spec_num_draft_tokens),
+            dtype=torch.int64,
+            device=self.device,
         )
         self._miss_dst = torch.zeros(
-            (max_num_req_slots, self.top_k), dtype=torch.int32, device=self.device
+            (max_num_req_slots, self.top_k * self.spec_num_draft_tokens),
+            dtype=torch.int32,
+            device=self.device,
         )
         self._miss_count = torch.zeros(
             (max_num_req_slots,), dtype=torch.int32, device=self.device
@@ -318,6 +362,36 @@ class HiSparseCoordinator:
     def set_decode_producer_stream(self, stream) -> None:
         self.decode_producer_stream = stream
 
+    def set_num_real_reqs(
+        self, *, batch_size: int, unpadded_batch_size: Optional[int]
+    ) -> None:
+        self.num_real_reqs.fill_(
+            batch_size if unpadded_batch_size is None else unpadded_batch_size
+        )
+
+    def bind_resident_draft_pool(
+        self, draft_pool: DSATokenToKVPool
+    ) -> MLATokenToKVPoolHost:
+        if self.spec_cache is None or self.draft_pool is not None:
+            raise RuntimeError(
+                "HiSparse resident draft pool must be bound once under speculative decoding."
+            )
+        self.draft_pool = draft_pool
+        self.draft_host_pool = MLATokenToKVPoolHost(
+            device_pool=draft_pool,
+            host_to_device_ratio=1,
+            host_size=0,
+            page_size=self.page_size,
+            layout="layer_first",
+            override_kv_cache_dim=draft_pool.kv_cache_dim,
+            pool_label="hisparse_draft_transfer",
+        )
+        if self.draft_host_pool.size != self.mem_pool_host.size:
+            raise ValueError(
+                "Target and draft HiSparse transfer pools must share the host index space."
+            )
+        return self.draft_host_pool
+
     def destroy(self) -> None:
         # Drain in-flight transfers so the buffer is idle, then unregister it.
         # See HostKVCache.destroy for why the explicit unregister matters.
@@ -327,6 +401,8 @@ class HiSparseCoordinator:
             # Skip-layer copies read the pinned host pool on the prefetch stream.
             self.prefetch_stream.synchronize()
         self.mem_pool_host.destroy()
+        if self.draft_host_pool is not None:
+            self.draft_host_pool.destroy()
 
     def get_token_stats(self) -> HiSparseTokenStats:
         device_allocator = self.token_to_kv_pool_allocator.hisparse_attn_allocator
@@ -385,7 +461,7 @@ class HiSparseCoordinator:
 
         self.ack_staging_queue.append(HiSparseAct(start_event, finish_event, req))
 
-    def admit_request_direct(self, req: Req) -> None:
+    def admit_request_direct(self, req: Req, *, load_draft: bool = True) -> None:
         """Direct-to-host path: KV data already resides in host pool via RDMA.
 
         Skips staging DMA entirely. Only allocates a small device buffer
@@ -401,7 +477,10 @@ class HiSparseCoordinator:
         self.alloc_device_buffer(req)
 
         host_len = self.host_token_len(req.kv.kv_allocated_len)
-        if host_len <= self.device_buffer_size:
+        if self.spec_cache is not None:
+            self.req_device_buffer_tokens[:, req.kv.req_pool_idx, :] = -1
+            self._host_committed_lens[req.kv.req_pool_idx] = req.kv.kv_committed_len
+        elif host_len <= self.device_buffer_size:
             # Short sequences (seq_len <= device_buffer_size): the kernel fast path
             # returns device_buffer_locs directly without any host loading, so we
             # must preload all tokens from host pool into the device buffer
@@ -413,6 +492,22 @@ class HiSparseCoordinator:
             self.req_device_buffer_tokens[
                 :, req.kv.req_pool_idx, : self.device_buffer_size
             ] = -1
+
+        if load_draft and self.draft_host_pool is not None:
+            if self.draft_pool is None:
+                raise RuntimeError("HiSparse draft transfer pool has no destination.")
+            host_indices = self.req_to_host_pool[req.kv.req_pool_idx, :host_len]
+            logical_indices = self.req_to_token_pool.req_to_token[
+                req.kv.req_pool_idx, :host_len
+            ].to(torch.int64)
+            for layer in range(self.draft_pool.layer_num):
+                self.draft_host_pool.load_to_device_per_layer(
+                    self.draft_pool,
+                    host_indices,
+                    logical_indices,
+                    layer,
+                    io_backend="kernel",
+                )
 
         req.hisparse_staging = False
         self._skip_first_backup[req.kv.req_pool_idx] = True
@@ -439,7 +534,10 @@ class HiSparseCoordinator:
             )
 
     def alloc_device_buffer(self, req: Req) -> None:
-        if self.is_dsv4_hisparse:
+        if self.spec_cache is not None:
+            allocated_len = req.kv.kv_allocated_len
+            alloc_size = self.padded_buffer_size
+        elif self.is_dsv4_hisparse:
             allocated_len = req.extend_range.end
             alloc_size = self.padded_buffer_size
         else:
@@ -484,6 +582,11 @@ class HiSparseCoordinator:
         self.req_device_buffer_token_locs[:, req.kv.req_pool_idx, :alloc_size] = (
             buffer_indices[:alloc_size]
         )
+        if self.spec_cache is not None:
+            self.spec_cache.reset_request(
+                req_index=req.kv.req_pool_idx,
+                scratch_locs=buffer_indices[self.attention_buffer_size :],
+            )
 
     def _grow_device_buffers(
         self,
@@ -661,6 +764,80 @@ class HiSparseCoordinator:
         self.mem_pool_device.full_to_hisparse_device_index_mapping[compressed_locs] = (
             reserved_buffer_loc
         )
+
+    def prepare_speculative_decode(
+        self, *, reqs: List[Req], req_pool_indices: torch.Tensor, reserve: int
+    ) -> None:
+        if self.spec_cache is None:
+            raise RuntimeError("HiSparse speculative state was not initialized.")
+        if reserve > self.page_size:
+            raise ValueError(
+                f"Speculative reservation {reserve} exceeds extra page {self.page_size}."
+            )
+        self._backup_speculative_committed(reqs=reqs)
+        starts = torch.tensor(
+            [req.kv.kv_committed_len for req in reqs],
+            dtype=torch.int64,
+            device=self.device,
+        )
+        positions = starts[:, None] + torch.arange(reserve, device=self.device)
+        rows = req_pool_indices[:, None]
+        logical_locs = self.req_to_token_pool.req_to_token[rows, positions]
+        buffer_slots = self.device_buffer_size + positions % self.page_size
+        device_locs = self.req_to_device_buffer[rows, buffer_slots]
+        self.mem_pool_device.full_to_hisparse_device_index_mapping[logical_locs] = (
+            device_locs
+        )
+        # Map the whole allocator reservation: overlap may advance GPU lengths before CPU results arrive.
+        self.req_device_buffer_tokens[:, rows, buffer_slots] = positions.to(torch.int32)
+        self.req_device_buffer_token_locs[:, rows, buffer_slots] = device_locs.to(
+            torch.int32
+        )
+
+    def _backup_speculative_committed(self, *, reqs: List[Req]) -> None:
+        host_locs_list = []
+        device_locs_list = []
+        for req in reqs:
+            row = req.kv.req_pool_idx
+            start = self._host_committed_lens[row]
+            end = req.kv.kv_committed_len
+            if start == end:
+                continue
+            if not 0 <= end - start <= self.page_size:
+                raise RuntimeError(
+                    f"HiSparse committed KV interval [{start}, {end}) exceeds its retained page."
+                )
+            host_locs = self.mem_pool_host.alloc_paged_token_slots(
+                self.req_to_host_pool,
+                self.req_to_host_pool_allocated_len,
+                row,
+                start,
+                end - start,
+            )
+            slots = (
+                self.device_buffer_size
+                + torch.arange(start, end, device=self.device) % self.page_size
+            )
+            host_locs_list.append(host_locs)
+            device_locs_list.append(self.req_to_device_buffer[row, slots])
+            self._host_committed_lens[row] = end
+        if not host_locs_list:
+            return
+        host_locs = torch.cat(host_locs_list)
+        device_locs = torch.cat(device_locs_list)
+        self.wait_for_pending_backup()
+        schedule_stream = device_module.current_stream()
+        with device_module.stream(self.decode_backup_stream):
+            self.decode_backup_stream.wait_stream(schedule_stream)
+            if self.decode_producer_stream is not None:
+                self.decode_backup_stream.wait_stream(self.decode_producer_stream)
+            self.mem_pool_host.backup_from_device_all_layer(
+                self.mem_pool_device, host_locs, device_locs, io_backend="kernel"
+            )
+            self._backup_done_event.record()
+            host_locs.record_stream(self.decode_backup_stream)
+            device_locs.record_stream(self.decode_backup_stream)
+        self._has_pending_backup = True
 
     def _eager_backup_previous_token(
         self,
@@ -931,8 +1108,13 @@ class HiSparseCoordinator:
         self.req_device_buffer_size[req.kv.req_pool_idx] = 0
         self.req_to_host_pool[req.kv.req_pool_idx, :] = -1
         self.req_to_host_pool_allocated_len[req.kv.req_pool_idx] = 0
-        self.lru_slots[:, req.kv.req_pool_idx, :].copy_(self._lru_init)
+        if self.lru_slots is not None:
+            self.lru_slots[:, req.kv.req_pool_idx, :].copy_(self._lru_init)
         self._skip_first_backup[req.kv.req_pool_idx] = False
+
+        if self.spec_cache is not None:
+            self.spec_cache.reset_request(req_index=req.kv.req_pool_idx)
+        self._host_committed_lens[req.kv.req_pool_idx] = 0
 
     def _run_swap_in_kernel(
         self,
@@ -948,6 +1130,17 @@ class HiSparseCoordinator:
         miss plan into self._miss_{src,dst,count} for the skip layers to replay.
         """
         num_reqs = req_pool_indices.size(0)
+        if num_reqs == 0:
+            return self.top_k_device_locs_buffer[:0].view(0, self.top_k)
+        if self.spec_cache is not None:
+            return self._run_spec_swap_in_kernel(
+                req_pool_indices=req_pool_indices,
+                compressed_seq_lens=compressed_seq_lens,
+                top_k_result=top_k_result,
+                layer_id=layer_id,
+                record_plan=record_plan,
+            )
+        assert self.lru_slots is not None
         top_k_indices = self.top_k_device_locs_buffer[:num_reqs]
 
         swap_in_fn = (
@@ -985,6 +1178,57 @@ class HiSparseCoordinator:
             **plan,
         )
         return top_k_indices
+
+    def _run_spec_swap_in_kernel(
+        self,
+        *,
+        req_pool_indices: torch.Tensor,
+        compressed_seq_lens: torch.Tensor,
+        top_k_result: torch.Tensor,
+        layer_id: int,
+        record_plan: bool,
+    ) -> torch.Tensor:
+        assert self.spec_cache is not None
+        num_reqs = req_pool_indices.size(0)
+        num_steps = self.spec_num_draft_tokens
+        num_rows = num_reqs * num_steps
+        if top_k_result.shape[0] < num_rows:
+            raise ValueError(
+                f"HiSparse expected at least {num_rows} verify rows, "
+                f"got {top_k_result.shape[0]}."
+            )
+        output = self.top_k_device_locs_buffer[:num_reqs].view(
+            num_reqs, num_steps, self.top_k
+        )
+        plan = (
+            dict(
+                miss_src=self._miss_src[:num_reqs],
+                miss_dst=self._miss_dst[:num_reqs],
+                miss_count=self._miss_count[:num_reqs],
+            )
+            if record_plan
+            else {}
+        )
+        load_cache_to_device_buffer_spec_mla(
+            # Attention-TP can append token padding after the complete request rows.
+            top_k_tokens=top_k_result[:num_rows].view(num_reqs, num_steps, self.top_k),
+            device_buffer_tokens=self.req_device_buffer_tokens[
+                layer_id, :, : self.attention_buffer_size
+            ],
+            device_buffer_locs=self.req_device_buffer_token_locs[
+                layer_id, :, : self.attention_buffer_size
+            ],
+            host_cache_locs=self.req_to_host_pool,
+            host_cache=self.mem_pool_host.kv_buffer[layer_id],
+            device_buffer=self.mem_pool_device.kv_buffer[layer_id],
+            top_k_device_locs=output,
+            req_pool_indices=req_pool_indices,
+            seq_lens=compressed_seq_lens[:num_rows],
+            state=self.spec_cache.states[layer_id],
+            num_real_reqs=self.num_real_reqs,
+            **plan,
+        )
+        return output.view(-1, self.top_k)
 
     def _run_copy_only_kernel(self, num_reqs: int, skip_layer: int) -> None:
         """Replay the anchor's recorded miss plan into a skip layer's buffers
@@ -1025,7 +1269,7 @@ class HiSparseCoordinator:
             # applies (shared index + lockstep buffers).
             slot = self._prefetch_slot[layer_id]
             self._prefetch_events[slot].wait(device_module.current_stream())
-            return self.top_k_device_locs_buffer[:num_reqs]
+            return self.top_k_device_locs_buffer[:num_reqs].view(-1, self.top_k)
 
         # Anchor: swap in synchronously (recording the plan), then prefetch the
         # skip layers' copies on the side stream.

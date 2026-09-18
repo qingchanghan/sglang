@@ -22,6 +22,7 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         kvcache: HiSparseDSATokenToKVPool,
         need_sort: bool,
         host_to_device_ratio: int = 2,
+        speculative_decode: bool = False,
     ):
         self._kvcache = kvcache
         self._size_full = size * host_to_device_ratio
@@ -31,6 +32,12 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.device = device
         self.page_size = page_size
         self.need_sort = need_sort
+        self.speculative_decode = speculative_decode
+        self._device_buffer_pages = (
+            torch.zeros(size // page_size + 1, dtype=torch.bool, device=device)
+            if speculative_decode
+            else None
+        )
 
         self.logical_attn_allocator = PagedTokenToKVPoolAllocator(
             self._size_full,
@@ -83,6 +90,15 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
     def get_kvcache(self):
         return self._kvcache
+
+    def check_decode_capacity(self, *, num_tokens: int, tree_cache) -> bool:
+        if self.speculative_decode:
+            return self.logical_attn_allocator.check_decode_capacity(
+                num_tokens=num_tokens, tree_cache=tree_cache
+            )
+        return super().check_decode_capacity(
+            num_tokens=num_tokens, tree_cache=tree_cache
+        )
 
     def alloc(self, need_size: int):
         if self.page_size != 1:
@@ -162,10 +178,15 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 extra_indices is not None
             ), "Hisparse allocation failed in alloc_device_buffer"
             buffer_indices = torch.cat([hisparse_indices, extra_indices])
+        if self._device_buffer_pages is not None:
+            self._device_buffer_pages[buffer_indices // self.page_size] = True
         return buffer_indices
 
     def free_hisparse_indices(self, buffer_indices: torch.Tensor):
-        self.hisparse_attn_allocator.free(buffer_indices[buffer_indices > 0])
+        buffer_indices = buffer_indices[buffer_indices > 0]
+        if self._device_buffer_pages is not None:
+            self._device_buffer_pages[buffer_indices // self.page_size] = False
+        self.hisparse_attn_allocator.free(buffer_indices)
 
     def get_last_loc_compressed(self, last_locs: torch.Tensor):
         return last_locs
@@ -235,6 +256,11 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def free_hisparse(self, free_indices: torch.Tensor):
         hisparse_indices = self._kvcache._translate_loc_to_hisparse_device(free_indices)
         hisparse_indices = hisparse_indices[hisparse_indices > 0]
+        if self._device_buffer_pages is not None:
+            # Rejected draft slots borrow the request's ring; only its owner frees it.
+            hisparse_indices = hisparse_indices[
+                ~self._device_buffer_pages[hisparse_indices // self.page_size]
+            ]
         self.free_hisparse_indices(hisparse_indices)
         self.full_to_hisparse_device_index_mapping[free_indices] = 0
 
@@ -243,6 +269,8 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.hisparse_attn_allocator.clear()
         # Note: the last item is -1, we don't clear it, see the comment in __init__
         self.full_to_hisparse_device_index_mapping[:-1].fill_(0)
+        if self._device_buffer_pages is not None:
+            self._device_buffer_pages.zero_()
         self.free_group = None
 
     # No deferred frees: free() must clear the full-to-hisparse mapping at once.

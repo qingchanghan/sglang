@@ -80,13 +80,58 @@ def validate_hisparse_speculative(server_args: ServerArgs) -> None:
     cfg = resolving_view(server_args)
     if cfg.speculative_algorithm is None:
         return
-    # Spec decode prep skips the coordinator's per-token device-buffer mapping
-    # and host backup, and the swap-in kernel takes one top-k row per request.
-    raise ValueError(
-        "--enable-hisparse does not support speculative decoding "
-        f"(--speculative-algorithm={cfg.speculative_algorithm}): speculative "
-        "KV bookkeeping and multi-query swap-in are not implemented. "
-        "Drop one of the two options."
+    if cfg.speculative_algorithm not in ("EAGLE", "NEXTN"):
+        raise ValueError(
+            f"HiSparse speculative decoding supports EAGLE/NEXTN, got {cfg.speculative_algorithm}."
+        )
+    if cfg.disaggregation_mode != "decode" or cfg.pp_size != 1:
+        raise ValueError(
+            "HiSparse speculative decoding requires PD decode with pp_size=1."
+        )
+    if cfg.speculative_adaptive or cfg.speculative_adaptive_config is not None:
+        raise ValueError(
+            "HiSparse speculative decoding currently requires fixed draft depth."
+        )
+    if get_platform().is_hip or cfg.device not in (None, "cuda"):
+        raise ValueError("HiSparse speculative decoding currently requires CUDA.")
+    if cfg.speculative_eagle_topk != 1:
+        raise ValueError(
+            "HiSparse speculative decoding currently requires eagle_topk=1."
+        )
+    steps = cfg.speculative_num_steps
+    drafts = cfg.speculative_num_draft_tokens
+    if steps is None or drafts is None or not 2 <= drafts <= 4 or steps + 1 != drafts:
+        raise ValueError(
+            "HiSparse speculative decoding requires 2-4 draft tokens and steps+1=draft_tokens; "
+            f"got steps={steps}, draft_tokens={drafts}."
+        )
+    if cfg.speculative_draft_model_path not in (None, cfg.model_path):
+        raise ValueError(
+            "HiSparse speculative decoding requires the target's native MTP draft."
+        )
+    # MLA resolves the unset backend to cpu_tensor after its KV pool is built.
+    if cfg.disaggregation_decode_retraction_backup not in (None, "cpu_tensor"):
+        raise ValueError(
+            "HiSparse speculative decoding requires cpu_tensor retraction backup."
+        )
+    from sglang.srt.configs.model_config import is_deepseek_dsa
+    from sglang.srt.managers.hisparse_spec_state import make_hisparse_spec_layout
+    from sglang.srt.mem_cache.sparsity.factory import parse_hisparse_config_json
+
+    hf_config = model_config_of(server_args).hf_config
+    if not is_deepseek_dsa(hf_config):
+        raise ValueError(
+            "HiSparse speculative decoding currently supports DSA MLA models only."
+        )
+    hisparse_cfg = parse_hisparse_config_json(cfg.hisparse_config)
+    make_hisparse_spec_layout(
+        num_draft_tokens=drafts,
+        top_k=hf_config.index_topk,
+        hot_size=hisparse_cfg.device_buffer_size,
+        page_size=64,
+        req_slots=1,
+        shared_layers=(False,),
+        scratch_size=hisparse_cfg.sparse_extra_config.get("spec_scratch_size"),
     )
 
 

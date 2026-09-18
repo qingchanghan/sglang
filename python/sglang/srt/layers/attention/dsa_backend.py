@@ -1970,7 +1970,19 @@ class DeepseekSparseAttnBackend(
             forward_batch.forward_mode
         )
 
-        if self.use_fused_topk:
+        if (
+            self.hisparse_coordinator is not None
+            and forward_batch.forward_mode.is_target_verify()
+        ):
+            topk_indices = self._pad_topk_indices(topk_indices, q_nope.shape[0])
+            page_table_1 = self.hisparse_coordinator.swap_in_selected_pages(
+                forward_batch.req_pool_indices,
+                metadata.dsa_seqlens_expanded,
+                topk_indices,
+                layer.layer_id,
+            )
+            page_table_1 = self._pad_topk_indices(page_table_1, q_nope.shape[0])
+        elif self.use_fused_topk:
             if topk_indices is not None:
                 topk_indices = self._pad_topk_indices(topk_indices, q_nope.shape[0])
 
@@ -2009,7 +2021,10 @@ class DeepseekSparseAttnBackend(
                 )
 
         # todo hisparse: to cover more backends
-        if self.hisparse_coordinator is not None:
+        if (
+            self.hisparse_coordinator is not None
+            and not forward_batch.forward_mode.is_target_verify()
+        ):
             # flash_mla_sparse_fwd / tilelang require int32 page indices.
             page_table_1 = self.token_to_kv_pool.translate_loc_to_hisparse_device(
                 page_table_1
@@ -3393,7 +3408,10 @@ class DeepseekSparseAttnBackend(
     ) -> DSAIndexerMetadata:
         force_unfused = not self.use_fused_topk or (
             self.hisparse_coordinator is not None
-            and forward_batch.forward_mode.is_decode_or_idle()
+            and (
+                forward_batch.forward_mode.is_decode_or_idle()
+                or forward_batch.forward_mode.is_target_verify()
+            )
         )
         return DSAIndexerMetadata(
             attn_metadata=self.forward_metadata,

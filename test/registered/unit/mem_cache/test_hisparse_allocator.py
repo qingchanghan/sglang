@@ -9,12 +9,65 @@ import torch
 from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.mem_cache.allocator.hisparse import (
     DeepSeekV4HiSparseTokenToKVPoolAllocator,
+    HiSparseTokenToKVPoolAllocator,
 )
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
+
+
+class TestHiSparseSpecAllocator(CustomTestCase):
+    def test_rejected_logical_slots_do_not_free_request_owned_device_pages(self):
+        allocator = object.__new__(HiSparseTokenToKVPoolAllocator)
+        allocator.page_size = 64
+        allocator.speculative_decode = True
+        allocator._device_buffer_pages = torch.tensor([False, False, True, False])
+        allocator.full_to_hisparse_device_index_mapping = torch.tensor(
+            [0, 128, 192, 0], dtype=torch.int64
+        )
+        allocator._kvcache = SimpleNamespace(
+            _translate_loc_to_hisparse_device=lambda indices: (
+                allocator.full_to_hisparse_device_index_mapping[indices]
+            )
+        )
+        allocator.logical_attn_allocator = MagicMock(size=256)
+        allocator.logical_attn_allocator.available_size.return_value = 128
+        allocator.hisparse_attn_allocator = MagicMock(size=256)
+        allocator.hisparse_attn_allocator.available_size.return_value = 64
+        logical = torch.tensor([1, 2])
+        allocator.free(logical)
+        allocator.logical_attn_allocator.free.assert_called_once_with(logical)
+        torch.testing.assert_close(
+            allocator.hisparse_attn_allocator.free.call_args.args[0],
+            torch.tensor([192]),
+        )
+        self.assertTrue(allocator._device_buffer_pages[2])
+        self.assertTrue(allocator.full_to_hisparse_device_index_mapping.eq(0).all())
+        allocator._device_buffer_pages[3] = True
+        allocator.free_hisparse_indices(torch.tensor([128, -1, 0]))
+        self.assertFalse(allocator._device_buffer_pages[2])
+        self.assertTrue(allocator._device_buffer_pages[3])
+        torch.testing.assert_close(
+            allocator.hisparse_attn_allocator.free.call_args.args[0],
+            torch.tensor([128]),
+        )
+
+    def test_spec_decode_capacity_uses_logical_pool_after_buffer_reservation(self):
+        allocator = object.__new__(HiSparseTokenToKVPoolAllocator)
+        allocator.speculative_decode = True
+        allocator.logical_attn_allocator = MagicMock()
+        allocator.logical_attn_allocator.check_decode_capacity.return_value = True
+        allocator.hisparse_attn_allocator = MagicMock()
+        allocator.hisparse_attn_allocator.available_size.return_value = 0
+        tree_cache = MagicMock()
+        self.assertTrue(
+            allocator.check_decode_capacity(num_tokens=128, tree_cache=tree_cache)
+        )
+        allocator.logical_attn_allocator.check_decode_capacity.assert_called_once_with(
+            num_tokens=128, tree_cache=tree_cache
+        )
 
 
 class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
