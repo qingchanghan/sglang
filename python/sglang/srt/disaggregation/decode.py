@@ -37,16 +37,16 @@ from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.disaggregation.common.conn import CommonKVManager, CommonKVReceiver
-from sglang.srt.disaggregation.draft_pool_probe import (
-    maybe_probe_draft_pool,
-    maybe_probe_draft_pool_batch,
-)
 from sglang.srt.disaggregation.decode_hicache_mixin import (
     DecodeHiCachePreallocMixin,
     DecodeHiCacheTransferMixin,
     DecodePrefixMatch,
     HiCacheRestoreGatedKVReceiver,
     HiCacheRestoreResult,
+)
+from sglang.srt.disaggregation.draft_pool_probe import (
+    maybe_probe_draft_pool,
+    maybe_probe_draft_pool_batch,
 )
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
@@ -821,6 +821,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         # allocate memory
         resumed_reqs = []
         indices_to_remove = set()
+        hisparse_req_budget = self._hisparse_available_req_slots()
         uses_swa_tail_prealloc = self._uses_swa_tail_prealloc()
         if uses_swa_tail_prealloc:
             full_allocatable_tokens, swa_allocatable_tokens = (
@@ -836,6 +837,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 continue
 
             if self.req_to_token_pool.available_size() <= 0:
+                break
+            if hisparse_req_budget <= 0:
                 break
 
             full_required, swa_required = self._prealloc_required_tokens(req)
@@ -855,13 +858,20 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     extra_reserved_reqs=len(resumed_reqs),
                 )
 
-            retraction_restore(
-                req,
-                self.tree_cache,
-                self.req_to_token_pool,
-                self.token_to_kv_pool_allocator,
-                get_disagg().disaggregation_decode_retraction_backup,
-            )
+            if (
+                self.scheduler.enable_hisparse
+                and not self.scheduler.hisparse_coordinator.is_dsv4_hisparse
+            ):
+                self.scheduler.hisparse_coordinator.restore_after_retraction(req)
+                hisparse_req_budget -= 1
+            else:
+                retraction_restore(
+                    req,
+                    self.tree_cache,
+                    self.req_to_token_pool,
+                    self.token_to_kv_pool_allocator,
+                    get_disagg().disaggregation_decode_retraction_backup,
+                )
 
         self.retracted_queue = [
             entry
@@ -870,6 +880,19 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         ]
 
         return resumed_reqs
+
+    def _hisparse_available_req_slots(self) -> float:
+        if not self.scheduler.enable_hisparse:
+            return float("inf")
+        available = (
+            self.token_to_kv_pool_allocator.hisparse_attn_allocator.available_size()
+        )
+        # Transfers reserve future buffers; waiting/running requests already own theirs.
+        return max(
+            0,
+            available // self.scheduler.hisparse_coordinator.padded_buffer_size
+            - len(self.transfer_queue.queue),
+        )
 
     def _update_handshake_waiters(
         self,
@@ -1173,16 +1196,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         # Each admitted req needs padded_buffer_size from hisparse device pool.
         # waiting_queue reqs already have device buffers (allocated in admit_request_direct),
         # only transfer_queue reqs are pending device buffer allocation.
-        hisparse_req_budget = float("inf")
-        if self.scheduler.enable_hisparse:
-            hisparse_avail = (
-                self.token_to_kv_pool_allocator.hisparse_attn_allocator.available_size()
-            )
-            hisparse_req_budget = max(
-                0,
-                hisparse_avail // self.scheduler.hisparse_coordinator.padded_buffer_size
-                - len(self.transfer_queue.queue),
-            )
+        hisparse_req_budget = self._hisparse_available_req_slots()
 
         # Then, preallocate the remaining requests if possible
         for i, decode_req in enumerate(self.queue):
@@ -2703,8 +2717,8 @@ class SchedulerDisaggregationDecodeMixin:
         # try to resume retracted requests if there are enough space for another `num_reserved_decode_tokens` decode steps
         resumed_reqs = self.disagg_decode_prealloc_queue.resume_retracted_reqs()
         self.waiting_queue.extend(resumed_reqs)
-        if len(self.disagg_decode_prealloc_queue.retracted_queue) > 0:
-            # if there are still retracted requests, we do not allocate new requests
+        has_retracted_reqs = bool(self.disagg_decode_prealloc_queue.retracted_queue)
+        if has_retracted_reqs and not self.enable_hisparse:
             return
 
         if not hasattr(self, "polling_count"):
@@ -2714,8 +2728,11 @@ class SchedulerDisaggregationDecodeMixin:
         self.polling_count = (self.polling_count + 1) % self.polling_interval
 
         if self.polling_count % self.polling_interval == 0:
-            req_conns, _ = self.disagg_decode_prealloc_queue.pop_preallocated()
-            self.disagg_decode_transfer_queue.extend(req_conns)
+            if not has_retracted_reqs:
+                req_conns, _ = self.disagg_decode_prealloc_queue.pop_preallocated()
+                self.disagg_decode_transfer_queue.extend(req_conns)
+            # HiSparse transfers already reserve physical buffers. Let them run
+            # and release those buffers even while retracted requests wait.
             transferred_reqs = (
                 self.disagg_decode_transfer_queue.pop_transferred()
             )  # the requests which kv has arrived

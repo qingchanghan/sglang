@@ -1,11 +1,18 @@
 from __future__ import annotations
 
-from typing import Sequence
+from typing import Any, Sequence
 
 import msgspec
 import torch
 
 from sglang.kernels.ops.kvcache.hisparse import HiSparseSpecState
+
+
+class HiSparseRetractionBackup(msgspec.Struct, frozen=True, kw_only=True):
+    num_tokens: int
+    host_kv: tuple[torch.Tensor, ...]
+    index_k: Any
+    draft_kv: Any = None
 
 
 class HiSparseSpecLayout(msgspec.Struct, frozen=True, kw_only=True):

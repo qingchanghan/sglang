@@ -14,6 +14,7 @@ from sglang.kernels.ops.kvcache.hisparse import (
 from sglang.srt.configs.model_config import dsa_layer_skips_topk, is_deepseek_dsa
 from sglang.srt.environ import envs
 from sglang.srt.managers.hisparse_spec_state import (
+    HiSparseRetractionBackup,
     HiSparseSpecCache,
     make_hisparse_spec_layout,
 )
@@ -22,6 +23,7 @@ from sglang.srt.mem_cache.allocator.hisparse import (
     DeepSeekV4HiSparseTokenToKVPoolAllocator,
     HiSparseTokenToKVPoolAllocator,
 )
+from sglang.srt.mem_cache.common import RetractionBackup
 from sglang.srt.mem_cache.hisparse_memory_pool import (
     HiSparseDSATokenToKVPool,
 )
@@ -1062,6 +1064,67 @@ class HiSparseCoordinator:
             self.abort_staging_request(req)
         else:
             self.request_finished(req)
+
+    def backup_for_retraction(self, req: Req) -> None:
+        num_tokens = req.kv.kv_committed_len
+        row = req.kv.req_pool_idx
+        if self.spec_cache is not None:
+            self._backup_speculative_committed(reqs=[req])
+        else:
+            seq_cpu = torch.tensor([num_tokens + 1], dtype=torch.int64)
+            rows_cpu = torch.tensor([row], dtype=torch.int64)
+            self._eager_backup_previous_token(
+                seq_cpu.to(self.device), rows_cpu.to(self.device), seq_cpu, rows_cpu
+            )
+        self.decode_backup_stream.synchronize()
+        host_indices = self.req_to_host_pool[row, :num_tokens].cpu()
+        logical_indices = self.req_to_token_pool.req_to_token[row, :num_tokens].to(
+            torch.int64
+        )
+        if self.decode_producer_stream is not None:
+            device_module.current_stream().wait_stream(self.decode_producer_stream)
+        backup = HiSparseRetractionBackup(
+            num_tokens=num_tokens,
+            host_kv=tuple(
+                layer[host_indices] for layer in self.mem_pool_host.kv_buffer
+            ),
+            index_k=self.mem_pool_device.index_key_cache.cpu_copy(logical_indices),
+            draft_kv=(
+                self.draft_pool.get_cpu_copy(logical_indices)
+                if self.draft_pool is not None
+                else None
+            ),
+        )
+        req.kv.retraction_backup = RetractionBackup(cpu_tensors=backup)
+
+    def restore_after_retraction(self, req: Req) -> None:
+        if req.kv.retraction_backup is None:
+            raise RuntimeError("HiSparse retracted request has no KV backup.")
+        backup = req.kv.retraction_backup.cpu_tensors
+        if not isinstance(backup, HiSparseRetractionBackup):
+            raise TypeError("HiSparse received a non-HiSparse retraction backup.")
+        if backup.num_tokens != req.kv.kv_committed_len:
+            raise ValueError(
+                "HiSparse retraction backup length does not match restored request."
+            )
+        row = req.kv.req_pool_idx
+        host_indices = self.req_to_host_pool[row, : backup.num_tokens].cpu()
+        logical_indices = self.req_to_token_pool.req_to_token[
+            row, : backup.num_tokens
+        ].to(torch.int64)
+        for layer, data in zip(
+            self.mem_pool_host.kv_buffer, backup.host_kv, strict=True
+        ):
+            layer.index_copy_(0, host_indices, data)
+        self.mem_pool_device.index_key_cache.load_cpu_copy(
+            backup.index_k, logical_indices
+        )
+        if self.draft_pool is not None:
+            if backup.draft_kv is None:
+                raise RuntimeError("HiSparse speculative retraction lost draft KV.")
+            self.draft_pool.load_cpu_copy(backup.draft_kv, logical_indices)
+        self.admit_request_direct(req, load_draft=False)
+        req.kv.retraction_backup = None
 
     def request_finished(self, req: Req):
         # release resources only after the execution of a potential overlapped batch

@@ -115,6 +115,53 @@ class TestHiSparseSpecState(CustomTestCase):
         )
         coordinator._backup_speculative_committed.assert_called_once_with(reqs=reqs)
 
+    def test_retraction_snapshot_survives_host_reuse_and_restores_new_indices(self):
+        coordinator = object.__new__(HiSparseCoordinator)
+        coordinator.spec_cache = object()
+        coordinator._backup_speculative_committed = MagicMock()
+        coordinator.decode_backup_stream = MagicMock()
+        coordinator.decode_producer_stream = None
+        coordinator.mem_pool_host = SimpleNamespace(
+            kv_buffer=torch.arange(2 * 32 * 4).view(2, 32, 1, 4)
+        )
+        coordinator.mem_pool_device = SimpleNamespace(index_key_cache=MagicMock())
+        coordinator.mem_pool_device.index_key_cache.cpu_copy.return_value = (
+            "index-snapshot"
+        )
+        coordinator.req_to_host_pool = torch.zeros((3, 8), dtype=torch.int64)
+        coordinator.req_to_host_pool[1] = torch.arange(3, 11)
+        coordinator.req_to_token_pool = SimpleNamespace(
+            req_to_token=torch.stack([torch.arange(8) + row * 100 for row in range(3)])
+        )
+        coordinator.draft_pool = MagicMock()
+        coordinator.draft_pool.get_cpu_copy.return_value = "draft-snapshot"
+        coordinator.admit_request_direct = MagicMock()
+        req = SimpleNamespace(kv=SimpleNamespace(kv_committed_len=8, req_pool_idx=1))
+        expected = coordinator.mem_pool_host.kv_buffer[:, 3:11].clone()
+        coordinator.backup_for_retraction(req)
+        coordinator.mem_pool_host.kv_buffer.zero_()
+        req.kv.req_pool_idx = 2
+        coordinator.req_to_host_pool[2] = torch.arange(20, 28)
+        coordinator.restore_after_retraction(req)
+        torch.testing.assert_close(
+            coordinator.mem_pool_host.kv_buffer[:, 20:28], expected
+        )
+        restored_indices = coordinator.draft_pool.load_cpu_copy.call_args.args[1]
+        torch.testing.assert_close(restored_indices, torch.arange(200, 208))
+        self.assertEqual(
+            coordinator.draft_pool.load_cpu_copy.call_args.args[0], "draft-snapshot"
+        )
+        self.assertEqual(
+            coordinator.mem_pool_device.index_key_cache.load_cpu_copy.call_args.args[0],
+            "index-snapshot",
+        )
+        torch.testing.assert_close(
+            coordinator.mem_pool_device.index_key_cache.load_cpu_copy.call_args.args[1],
+            torch.arange(200, 208),
+        )
+        coordinator.admit_request_direct.assert_called_once_with(req, load_draft=False)
+        self.assertIsNone(req.kv.retraction_backup)
+
     def test_scratch_covers_union_capacity_after_page_rounding(self):
         for hot, steps, expected in [(4096, 4, 4096), (4096, 3, 2048), (8192, 4, 64)]:
             with self.subTest(hot=hot, steps=steps):

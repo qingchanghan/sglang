@@ -1,7 +1,7 @@
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 import torch
@@ -19,6 +19,105 @@ register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
 class TestHiSparseSpecAllocator(CustomTestCase):
+    def test_retracted_requests_wait_for_physical_buffers_reserved_by_transfers(self):
+        from sglang.srt.disaggregation.decode import DecodePreallocQueue
+
+        queue = object.__new__(DecodePreallocQueue)
+        queue.scheduler = SimpleNamespace(
+            enable_hisparse=True,
+            hisparse_coordinator=SimpleNamespace(padded_buffer_size=8320),
+        )
+        queue.token_to_kv_pool_allocator = SimpleNamespace(
+            hisparse_attn_allocator=SimpleNamespace(
+                available_size=lambda: 8320,
+            )
+        )
+        queue.transfer_queue = SimpleNamespace(queue=[object()])
+        queue.retracted_queue = [SimpleNamespace(rid="retracted")]
+        queue.req_to_token_pool = SimpleNamespace(available_size=lambda: 10)
+        queue._uses_swa_tail_prealloc = lambda: False
+        queue._allocatable_token_budgets = lambda **kwargs: 1000000
+        queue._pre_alloc = MagicMock()
+        self.assertEqual(queue.resume_retracted_reqs(), [])
+        self.assertEqual(len(queue.retracted_queue), 1)
+        queue._pre_alloc.assert_not_called()
+        queue.transfer_queue.queue.clear()
+        self.assertEqual(queue._hisparse_available_req_slots(), 1)
+
+    def test_completed_transfer_drains_while_retracted_requests_wait(self):
+        from sglang.srt.disaggregation.decode import SchedulerDisaggregationDecodeMixin
+
+        transferred_req = object()
+        prealloc = SimpleNamespace(
+            resume_retracted_reqs=lambda: [],
+            retracted_queue=[object()],
+            pop_preallocated=MagicMock(),
+        )
+        transfer = SimpleNamespace(
+            resolve_deferred_releases=MagicMock(),
+            pop_transferred=MagicMock(return_value=[transferred_req]),
+        )
+        scheduler = SimpleNamespace(
+            enable_decode_hicache=False,
+            enable_hisparse=True,
+            disagg_decode_prealloc_queue=prealloc,
+            disagg_decode_transfer_queue=transfer,
+            hisparse_coordinator=SimpleNamespace(admit_request_direct=MagicMock()),
+            waiting_queue=[],
+            polling_count=0,
+            polling_interval=1,
+        )
+        with patch(
+            "sglang.srt.disaggregation.decode.get_disagg",
+            return_value=SimpleNamespace(
+                disaggregation_decode_enable_offload_kvcache=False
+            ),
+        ):
+            SchedulerDisaggregationDecodeMixin.process_decode_queue(scheduler)
+        prealloc.pop_preallocated.assert_not_called()
+        transfer.pop_transferred.assert_called_once()
+        self.assertEqual(scheduler.waiting_queue, [transferred_req])
+        scheduler.hisparse_coordinator.admit_request_direct.assert_called_once_with(
+            transferred_req
+        )
+
+    def test_retraction_snapshots_before_coordinator_releases_host_rows(self):
+        from sglang.srt.managers.schedule_batch import release_req
+
+        calls = []
+        req = SimpleNamespace(
+            finished=lambda: False,
+            reset_for_retract=lambda: calls.append("reset"),
+        )
+        coordinator = SimpleNamespace(
+            is_dsv4_hisparse=False,
+            backup_for_retraction=lambda req: calls.append("backup"),
+            retract_req=lambda req: calls.append("release_host"),
+        )
+        prefix = "sglang.srt.managers.schedule_batch."
+        with (
+            patch(
+                prefix + "get_disagg",
+                return_value=SimpleNamespace(disaggregation_mode="decode"),
+            ),
+            patch(
+                prefix + "release_kv_cache",
+                side_effect=lambda *a, **k: calls.append("release_logical"),
+            ),
+            patch(prefix + "evict_from_tree_cache"),
+        ):
+            self.assertTrue(
+                release_req(
+                    req=req,
+                    remaing_req_count=1,
+                    req_to_token_pool=MagicMock(),
+                    token_to_kv_pool_allocator=MagicMock(),
+                    tree_cache=MagicMock(),
+                    hisparse_coordinator=coordinator,
+                )
+            )
+        self.assertEqual(calls, ["backup", "release_host", "release_logical", "reset"])
+
     def test_rejected_logical_slots_do_not_free_request_owned_device_pages(self):
         allocator = object.__new__(HiSparseTokenToKVPoolAllocator)
         allocator.page_size = 64

@@ -2045,6 +2045,12 @@ def release_req(
 ) -> bool:
     """Returns False when the KV backup failed and the request cannot be resumed."""
     if hisparse_coordinator is not None and not req.finished():
+        if (
+            offload_kv
+            and get_disagg().disaggregation_mode == "decode"
+            and not hisparse_coordinator.is_dsv4_hisparse
+        ):
+            hisparse_coordinator.backup_for_retraction(req)
         hisparse_coordinator.retract_req(req)
 
     # In decode disaggregation the retracted KV is offloaded to host so it can be
@@ -2052,12 +2058,7 @@ def release_req(
     # Callers that will recompute the KV instead (PD true-retraction rebootstrap)
     # pass offload_kv=False to skip the wasteful device->host copy.
     backup_saved = True
-    # HiSparse keeps the full KV in its host pool and retract_req() above already
-    # waited for the pending host backup before freeing the device buffer, so the
-    # request can be resumed by swapping back in. A second copy into a CPU tensor
-    # would be redundant, and neither its allocator nor its device pool implements
-    # get_cpu_copy -- taking this path raises NotImplementedError and kills the
-    # scheduler the first time decode has to retract.
+    # HiSparse snapshots its host KV and indexer state before releasing the pool rows.
     if (
         get_disagg().disaggregation_mode == "decode"
         and offload_kv
