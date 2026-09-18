@@ -174,6 +174,151 @@ def _assert_output_matches_tokens(
 
 
 class TestHiSparseSpec(CustomTestCase):
+    def test_small_scratch_preserves_a_full_hot_sized_union(self) -> None:
+        """Every selected KV row survives scratch overflow and cache rotation."""
+        hot_size, page_size, num_steps, top_k = 8192, 64, 4, 2048
+        total_occurrences = num_steps * top_k
+        for scratch_size in (1, 64, 256, 8192):
+            for num_hits in (0, 4096):
+                with self.subTest(scratch_size=scratch_size, num_hits=num_hits):
+                    state = _make_state(
+                        num_reqs=1,
+                        hot_buffer_size=hot_size,
+                        page_size=page_size,
+                        scratch_size=scratch_size,
+                        seq_len=65536,
+                        item_words=82,
+                        metadata_occurrences=total_occurrences,
+                    )
+                    seq_lens = torch.full(
+                        (num_steps,), 65536, dtype=torch.int32, device=DEVICE
+                    )
+                    for iteration in range(3):
+                        num_misses = total_occurrences - num_hits
+                        hits = torch.arange(num_hits, dtype=torch.int32, device=DEVICE)
+                        misses = (
+                            hot_size
+                            + iteration * total_occurrences
+                            + torch.arange(num_misses, dtype=torch.int32, device=DEVICE)
+                        )
+                        tokens = torch.cat((hits, misses)).view(1, num_steps, top_k)
+                        out = _run_swap(
+                            top_k_tokens=tokens, seq_lens=seq_lens, state=state
+                        )
+                        torch.cuda.synchronize()
+                        self.assertTrue(out.ge(0).all().item())
+                        self.assertEqual(torch.unique(out).numel(), total_occurrences)
+                        _assert_output_matches_tokens(state, out, tokens)
+                        out = _run_swap(
+                            top_k_tokens=tokens, seq_lens=seq_lens, state=state
+                        )
+                        torch.cuda.synchronize()
+                        _assert_output_matches_tokens(state, out, tokens)
+                        self.assertEqual(state.swap_state.scratch_state[0, 0].item(), 0)
+
+    def test_small_scratch_records_replayable_full_union_plan(self) -> None:
+        """Copy-only shared layers resolve the same rows after direct overflow."""
+        hot_size, num_steps, top_k = 8192, 4, 2048
+        total_occurrences = num_steps * top_k
+        state = _make_state(
+            num_reqs=1,
+            hot_buffer_size=hot_size,
+            page_size=64,
+            scratch_size=64,
+            seq_len=32768,
+            item_words=82,
+            metadata_occurrences=total_occurrences,
+        )
+        tokens = (
+            (hot_size + torch.arange(total_occurrences, device=DEVICE))
+            .to(torch.int32)
+            .view(1, num_steps, top_k)
+        )
+        miss_src = torch.full(
+            (1, total_occurrences), -1, dtype=torch.int64, device=DEVICE
+        )
+        miss_dst = torch.full(
+            (1, total_occurrences), -1, dtype=torch.int32, device=DEVICE
+        )
+        miss_count = torch.zeros(1, dtype=torch.int32, device=DEVICE)
+        out = _run_swap(
+            top_k_tokens=tokens,
+            seq_lens=torch.full((num_steps,), 32768, dtype=torch.int32, device=DEVICE),
+            state=state,
+            miss_src=miss_src,
+            miss_dst=miss_dst,
+            miss_count=miss_count,
+        )
+        shared_layer_buffer = torch.full_like(state.device_buffer, -1)
+        copy_cache_planned_mla(
+            miss_src=miss_src,
+            miss_dst=miss_dst,
+            miss_count=miss_count,
+            num_real_reqs=torch.ones(1, dtype=torch.int32, device=DEVICE),
+            host_cache=state.host_cache,
+            device_buffer=shared_layer_buffer,
+            item_size_bytes=656,
+        )
+        torch.cuda.synchronize()
+        self.assertTrue(out.ge(0).all().item())
+        self.assertEqual(miss_count.item(), total_occurrences)
+        expected = tokens.to(torch.int64).unsqueeze(-1) * TOKEN_SCALE + torch.arange(
+            82, dtype=torch.int64, device=DEVICE
+        )
+        torch.testing.assert_close(shared_layer_buffer[out.to(torch.long)], expected)
+        _assert_output_matches_tokens(state, out, tokens)
+
+    def test_small_scratch_graph_replay_with_changing_misses_and_padding(self) -> None:
+        """Graph replays preserve new misses without touching a padded request."""
+        hot_size, num_steps, top_k = 8192, 4, 2048
+        total_occurrences = num_steps * top_k
+        state = _make_state(
+            num_reqs=2,
+            hot_buffer_size=hot_size,
+            page_size=64,
+            scratch_size=64,
+            seq_len=65536,
+            item_words=82,
+            metadata_occurrences=total_occurrences,
+        )
+        tokens = torch.arange(total_occurrences, dtype=torch.int32, device=DEVICE)
+        tokens = tokens.view(1, num_steps, top_k).repeat(2, 1, 1).contiguous()
+        out = torch.empty_like(tokens)
+        req_indices = torch.tensor([1, 0], dtype=torch.int64, device=DEVICE)
+        real_count = torch.ones(1, dtype=torch.int32, device=DEVICE)
+        seq_lens = torch.full((2 * num_steps,), 65536, dtype=torch.int32, device=DEVICE)
+
+        def run():
+            return _run_swap(
+                top_k_tokens=tokens,
+                seq_lens=seq_lens,
+                state=state,
+                out=out,
+                req_pool_indices=req_indices,
+                num_real_reqs=real_count,
+            )
+
+        run()
+        torch.cuda.synchronize()
+        untouched = state.swap_state.cache_index[0].clone()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            run()
+        for iteration in range(3):
+            tokens[0].copy_(
+                (
+                    hot_size
+                    + iteration * total_occurrences
+                    + torch.arange(total_occurrences, dtype=torch.int32, device=DEVICE)
+                ).view(num_steps, top_k)
+            )
+            graph.replay()
+            torch.cuda.synchronize()
+            self.assertTrue(out[0].ge(0).all().item())
+            self.assertTrue(out[1].eq(0).all().item())
+            _assert_output_matches_tokens(state, out[:1], tokens[:1])
+            torch.testing.assert_close(state.swap_state.cache_index[0], untouched)
+
     def test_deduplicates_repeated_misses_and_copies_full_items(self) -> None:
         hot_size, page_size = 4096, 64
         num_steps, top_k, item_words = 4, 2048, 72
