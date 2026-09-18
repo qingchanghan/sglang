@@ -204,6 +204,10 @@ def cal_padded_tokens(forward_batch: "ForwardBatch"):
 
     global_num_tokens = forward_batch.global_num_tokens_cpu.copy()
     sync_group_size = len(global_num_tokens)
+    # Match the TP alignment applied before CP padding in prepare_mlp_sync_batch.
+    attn_tp_size = get_parallel().attn_tp_size
+    for i in range(sync_group_size):
+        global_num_tokens[i] = ceil_align(global_num_tokens[i], attn_tp_size)
     attn_cp_size = get_parallel().attn_cp_size
     # Must mirror ForwardBatch.prepare_mlp_sync_batch, which applies cp_align_size only when
     # CP-v2 is disabled. Under enable_cp_v2() the speculative forwards (TARGET_VERIFY /
