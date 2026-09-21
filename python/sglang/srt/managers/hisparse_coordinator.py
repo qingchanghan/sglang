@@ -1071,7 +1071,20 @@ class HiSparseCoordinator:
         if self.spec_cache is not None:
             self._backup_speculative_committed(reqs=[req])
         else:
-            seq_cpu = torch.tensor([num_tokens + 1], dtype=torch.int64)
+            # Non-spec allocation advances kv_committed_len before an overlapped
+            # result reaches output_ids. Retraction discards that pending result;
+            # decode preallocation resumes only the prefix behind the last
+            # received output token. Do not include the pending step in its backup.
+            num_tokens = len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
+            if num_tokens > req.kv.kv_committed_len:
+                raise ValueError(
+                    f"HiSparse retraction prefix {num_tokens} exceeds available KV "
+                    f"{req.kv.kv_committed_len} for request {req.rid}."
+                )
+            # The reserved device slot still holds the newest computed token,
+            # even when it is outside the resumable prefix. Flush at its original
+            # position; using num_tokens here would overwrite the previous token.
+            seq_cpu = torch.tensor([req.kv.kv_committed_len + 1], dtype=torch.int64)
             rows_cpu = torch.tensor([row], dtype=torch.int64)
             self._eager_backup_previous_token(
                 seq_cpu.to(self.device), rows_cpu.to(self.device), seq_cpu, rows_cpu
@@ -1105,7 +1118,8 @@ class HiSparseCoordinator:
             raise TypeError("HiSparse received a non-HiSparse retraction backup.")
         if backup.num_tokens != req.kv.kv_committed_len:
             raise ValueError(
-                "HiSparse retraction backup length does not match restored request."
+                "HiSparse retraction backup length does not match restored request: "
+                f"backup={backup.num_tokens}, restored={req.kv.kv_committed_len}."
             )
         row = req.kv.req_pool_idx
         host_indices = self.req_to_host_pool[row, : backup.num_tokens].cpu()
