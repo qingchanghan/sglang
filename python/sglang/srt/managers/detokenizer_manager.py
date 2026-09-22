@@ -526,12 +526,21 @@ class LimitedCapacityDict(OrderedDict):
         super().__init__(*args, **kwargs)
         self.capacity = capacity
 
+    def __getitem__(self, key):
+        # Eviction drops the front and OrderedDict does not reorder on read;
+        # without this a still-producing stream is evicted once `capacity`
+        # newer requests have arrived, purely because it started earlier.
+        value = super().__getitem__(key)
+        self.move_to_end(key)
+        return value
+
     def __setitem__(self, key, value):
-        if len(self) >= self.capacity:
-            # Remove the oldest element (first item in the dict)
+        # Only a new key can push the dict past capacity; updating an existing
+        # one must not evict a live entry.
+        if key not in self and len(self) >= self.capacity:
             self.popitem(last=False)
-        # Set the new item
         super().__setitem__(key, value)
+        self.move_to_end(key)
 
 
 def run_detokenizer_process(
