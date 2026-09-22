@@ -590,6 +590,41 @@ class HiSparseCoordinator:
                 scratch_locs=buffer_indices[self.attention_buffer_size :],
             )
 
+    def device_buffer_growth_reserve(self) -> int:
+        """Capacity promised to requests that currently own a partial buffer."""
+        active_caps = self.req_device_buffer_size[self.req_device_buffer_size > 0]
+        return int((self.padded_buffer_size - active_caps).clamp_min(0).sum().item())
+
+    def _device_buffer_growth_sizes(
+        self, seq_lens_cpu: torch.Tensor, req_pool_indices_cpu: torch.Tensor
+    ) -> torch.Tensor:
+        """Physical slots needed for these next-step lengths, including the tail page."""
+        current_caps = self.req_device_buffer_size[req_pool_indices_cpu]
+        page_size = self.mem_pool_device.page_size
+        new_caps = ((seq_lens_cpu + page_size - 1) // page_size * page_size).clamp(
+            max=self.device_buffer_size
+        )
+        new_caps = torch.where(
+            new_caps == self.device_buffer_size, self.padded_buffer_size, new_caps
+        )
+        needs_grow = (seq_lens_cpu <= self.device_buffer_size) & (
+            seq_lens_cpu > current_caps
+        )
+        return torch.where(needs_grow, new_caps - current_caps, 0)
+
+    def can_grow_device_buffers(
+        self, seq_lens_cpu: torch.Tensor, req_pool_indices_cpu: torch.Tensor
+    ) -> bool:
+        needed = int(
+            self._device_buffer_growth_sizes(seq_lens_cpu, req_pool_indices_cpu)
+            .sum()
+            .item()
+        )
+        return (
+            needed
+            <= self.token_to_kv_pool_allocator.hisparse_attn_allocator.available_size()
+        )
+
     def _grow_device_buffers(
         self,
         seq_lens: torch.Tensor,
@@ -599,11 +634,12 @@ class HiSparseCoordinator:
     ) -> torch.Tensor:
         """Grow device buffers for requests whose sequence length exceeds current capacity."""
         current_caps = self.req_device_buffer_size[req_pool_indices_cpu]
-        short_reqs_cpu = seq_lens_cpu <= self.device_buffer_size
-        needs_grow_cpu = short_reqs_cpu & (seq_lens_cpu > current_caps)
+        grow_sizes_cpu = self._device_buffer_growth_sizes(
+            seq_lens_cpu, req_pool_indices_cpu
+        )
+        needs_grow_cpu = grow_sizes_cpu > 0
 
         if torch.any(needs_grow_cpu):
-            page_size = self.mem_pool_device.page_size
             grow_indices = torch.where(needs_grow_cpu)[0]
 
             # Compute all grow sizes on CPU, then do a single bulk allocation
@@ -615,17 +651,8 @@ class HiSparseCoordinator:
             for i in grow_indices.tolist():
                 req_idx = int(req_pool_indices_cpu[i])
                 current_cap = int(current_caps[i])
-                seq_len = int(seq_lens_cpu[i])
-
-                new_cap = min(
-                    ((seq_len + page_size - 1) // page_size) * page_size,
-                    self.device_buffer_size,
-                )
-                if new_cap == self.device_buffer_size:
-                    new_cap = self.padded_buffer_size
-                grow_size = new_cap - current_cap
-                if grow_size <= 0:
-                    continue
+                grow_size = int(grow_sizes_cpu[i])
+                new_cap = current_cap + grow_size
                 req_idxs.append(req_idx)
                 old_caps.append(current_cap)
                 new_caps.append(new_cap)

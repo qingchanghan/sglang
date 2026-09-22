@@ -25,7 +25,9 @@ class TestHiSparseSpecAllocator(CustomTestCase):
         queue = object.__new__(DecodePreallocQueue)
         queue.scheduler = SimpleNamespace(
             enable_hisparse=True,
-            hisparse_coordinator=SimpleNamespace(padded_buffer_size=8320),
+            hisparse_coordinator=SimpleNamespace(
+                padded_buffer_size=8320, device_buffer_growth_reserve=lambda: 0
+            ),
         )
         queue.token_to_kv_pool_allocator = SimpleNamespace(
             hisparse_attn_allocator=SimpleNamespace(

@@ -887,10 +887,14 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         available = (
             self.token_to_kv_pool_allocator.hisparse_attn_allocator.available_size()
         )
-        # Transfers reserve future buffers; waiting/running requests already own theirs.
+        coordinator = self.scheduler.hisparse_coordinator
+        # Short waiting/running requests own only part of their eventual buffer.
+        # Do not promise their remaining growth capacity to new or resumed requests.
+        available -= coordinator.device_buffer_growth_reserve()
+        # Transfers have not allocated a device buffer yet and reserve a full one.
         return max(
             0,
-            available // self.scheduler.hisparse_coordinator.padded_buffer_size
+            available // coordinator.padded_buffer_size
             - len(self.transfer_queue.queue),
         )
 
@@ -1194,8 +1198,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
         # HiSparse physical constraint: max requests by device buffer capacity.
         # Each admitted req needs padded_buffer_size from hisparse device pool.
-        # waiting_queue reqs already have device buffers (allocated in admit_request_direct),
-        # only transfer_queue reqs are pending device buffer allocation.
+        # Include remaining growth for partial buffers plus full transfer reservations.
         hisparse_req_budget = self._hisparse_available_req_slots()
 
         # Then, preallocate the remaining requests if possible

@@ -3028,13 +3028,34 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         return total
 
     def check_decode_mem(self, selected_indices: Optional[List[int]] = None):
-        """Whether the next decode step fits in the KV pool. The ALLOCATOR owns
-        the capacity gate (eviction + any per-step reservations of its own) —
-        the retract loop converges on this same check, so allocator-side
-        shortfalls retract gracefully instead of tripping fail-loud alloc
-        errors."""
+        """Check capacity before decode preparation mutates the batch.
+
+        The allocator handles logical KV reservations and eviction. Paged,
+        non-spec DSA HiSparse also grows physical buffers independently of logical
+        page allocation; the retract loop must check both pools.
+        """
         num_tokens = self.new_tokens_required_next_decode(selected_indices)
-        return self.token_to_kv_pool_allocator.check_decode_capacity(
+        allocator = self.token_to_kv_pool_allocator
+        coordinator = self.hisparse_coordinator
+        if (
+            coordinator is not None
+            and not coordinator.is_dsv4_hisparse
+            and self.spec_algorithm.is_none()
+            # page_size=1 uses alloc(), which also consumes physical slots;
+            # only paged alloc_decode() allocates purely logical KV here.
+            and allocator.page_size > 1
+        ):
+            seq_lens_cpu = self.seq_lens_cpu
+            req_pool_indices_cpu = self.req_pool_indices_cpu
+            if selected_indices is not None:
+                seq_lens_cpu = seq_lens_cpu[selected_indices]
+                req_pool_indices_cpu = req_pool_indices_cpu[selected_indices]
+            return allocator.logical_attn_allocator.check_decode_capacity(
+                num_tokens=num_tokens, tree_cache=self.tree_cache
+            ) and coordinator.can_grow_device_buffers(
+                seq_lens_cpu + 1, req_pool_indices_cpu
+            )
+        return allocator.check_decode_capacity(
             num_tokens=num_tokens, tree_cache=self.tree_cache
         )
 
