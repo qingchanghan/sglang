@@ -304,8 +304,18 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
 
         # Initialize decode status
         read_ids, surr_ids = [], []
+        rid_counts = {}
         for i in range(bs):
             rid = recv_obj.rids[i]
+            rid_counts[rid] = rid_counts.get(rid, 0) + 1
+            if rid_counts[rid] == 2:
+                # Diagnose collisions before rows extend the same decode state,
+                # including unfinished duplicates that never raise KeyError.
+                logger.warning(
+                    "Duplicate request ID %s in one detokenizer batch; "
+                    "distinct live requests may share decode state.",
+                    rid,
+                )
             if rid not in self.decode_status:
                 s = DecodeStatus(
                     decoded_text=recv_obj.decoded_texts[i],
@@ -375,10 +385,6 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
                 # Separate aborted PD entries can share a rid. The first terminal
                 # row already removed its state. Keep the parallel output arrays
                 # aligned without hiding unrelated cache eviction or lost state.
-                logger.warning(
-                    "Ignoring duplicate terminal text for request %s in one batch.",
-                    rid,
-                )
                 output_strs.append("")
                 continue
             try:
