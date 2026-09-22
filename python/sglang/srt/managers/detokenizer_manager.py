@@ -368,8 +368,19 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
 
         # Incremental decoding
         output_strs = []
+        finished_rids = set()
         for i in range(bs):
             rid = recv_obj.rids[i]
+            if recv_obj.finished_reasons[i] is not None and rid in finished_rids:
+                # Separate aborted PD entries can share a rid. The first terminal
+                # row already removed its state. Keep the parallel output arrays
+                # aligned without hiding unrelated cache eviction or lost state.
+                logger.warning(
+                    "Ignoring duplicate terminal text for request %s in one batch.",
+                    rid,
+                )
+                output_strs.append("")
+                continue
             try:
                 s = self.decode_status[rid]
             except KeyError:
@@ -406,6 +417,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
 
             if rid in self.decode_status:
                 del self.decode_status[rid]
+            finished_rids.add(rid)
 
             # Finished: materialize once, trim the matched stop, emit the tail.
             output_str = self.trim_matched_stop(
